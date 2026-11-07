@@ -1,0 +1,665 @@
+-- Auto Craft + Claim | draggable GUI
+-- Auto-claims finished Combine-o-Matic crafts and auto-starts the recipes you pick
+-- (only when you have the pets / shards for them). Walks to the machine, then walks back
+-- to where you were standing. Uses the same calls as the VY hub.
+
+local genv = (type(getgenv) == "function" and getgenv()) or _G
+if type(genv.AutoClaimCrafts) == "table" and type(genv.AutoClaimCrafts.Stop) == "function" then
+    pcall(genv.AutoClaimCrafts.Stop)
+end
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local UIS = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local PathfindingService = game:GetService("PathfindingService")
+local LP = Players.LocalPlayer
+
+local MACHINE_ID = "HalloweenGamesCombine"
+local MACHINE_MODEL = "HalloweenPetCraftingMachine"
+local POLL = 4 -- seconds between checks
+
+local alive = true
+local autoClaim = true
+local autoCraft = false
+local gotoMachine = true
+local picks = {} -- [recipe name] = true
+local claimed, started = 0, 0
+local claimNote, craftNote = "Starting...", "Pick crafts below"
+local lastRecipes = {}
+
+---------------------------------------------------------------- game access
+local canId = type(setthreadidentity) == "function"
+local idGame, idExec = 2, 7
+if type(getthreadidentity) == "function" then
+    local ok, id = pcall(getthreadidentity)
+    if ok and type(id) == "number" then idExec = id end
+end
+
+local function gcall(fn, ...)
+    if type(fn) ~= "function" then return false, "not a function" end
+    if canId then pcall(setthreadidentity, idGame) end
+    local r = table.pack(pcall(fn, ...))
+    if canId then pcall(setthreadidentity, idExec) end
+    return table.unpack(r, 1, r.n)
+end
+local function gval(fn, ...)
+    local ok, a, b, c = gcall(fn, ...)
+    if ok then return a, b, c end
+    return nil
+end
+local function isfn(t, k) return type(t) == "table" and type(t[k]) == "function" end
+
+local function req(path, optional)
+    local ok, mod = gcall(function()
+        local node = RS
+        for seg in string.gmatch(path, "[^%.]+") do
+            node = node:WaitForChild(seg, optional and 2 or 10) or error("missing " .. path)
+        end
+        return require(node)
+    end)
+    return ok and mod or nil
+end
+
+local Network, Directory, Instancing, FFlags, Forge
+local function ensureModules()
+    if Network and Directory then return true end
+    Network = Network or req("Library.Client.Network")
+    Directory = Directory or req("Library.Directory")
+    Instancing = Instancing or req("Library.Client.InstancingCmds")
+    FFlags = FFlags or req("Library.Client.FFlags", true)
+    Forge = Forge or req("Library.Client.HalloweenGamesCmds.Forge", true)
+    return Network ~= nil and Directory ~= nil
+end
+
+local function machineDir()
+    local all = type(Directory) == "table" and rawget(Directory, "HalloweenCraftingMachines") or nil
+    if all == nil and type(Directory) == "table" then
+        local ok, v = pcall(function() return Directory.HalloweenCraftingMachines end)
+        all = ok and v or nil
+    end
+    return type(all) == "table" and all[MACHINE_ID] or nil
+end
+
+local function flagValue(name)
+    if not (name and type(FFlags) == "table" and type(FFlags.Keys) == "table" and type(FFlags.Get) == "function") then return nil end
+    local key = FFlags.Keys[name]
+    if key == nil then return nil end
+    return gval(FFlags.Get, key)
+end
+
+local function ingredientNeed(dir, ing)
+    local amount = tonumber(flagValue(ing.AmountFFlag)) or tonumber(ing.Amount) or 1
+    local need = math.max(1, math.ceil(amount))
+    if not ing.NoDiscount and type(dir.IngredientAmount) == "function" then
+        local ok, v = pcall(dir.IngredientAmount, nil, need)
+        if ok and type(v) == "number" and v == v then need = math.max(1, math.ceil(v)) end
+    end
+    return need
+end
+
+local function ingredientHave(dir, ing)
+    local okC, have = gcall(function()
+        local item = ing.Item:Clone()
+        local n = item:CountAny()
+        if dir.AnyVariantInputs and item:IsA("Pet") then
+            for _, v in ipairs({ "Golden", "Rainbow" }) do
+                local c = item:Clone()
+                if c["CanBe" .. v](c) then
+                    c["Set" .. v](c)
+                    n += c:CountAny()
+                end
+            end
+            if item:CanBeShiny() then
+                for _, v in ipairs({ "Normal", "Golden", "Rainbow" }) do
+                    local c = item:Clone()
+                    local ok = v == "Normal" or (v == "Golden" and c:CanBeGolden()) or (v == "Rainbow" and c:CanBeRainbow())
+                    if ok then
+                        if v ~= "Normal" then c["Set" .. v](c) end
+                        c:SetShiny(true)
+                        n += c:CountAny()
+                    end
+                end
+            end
+        end
+        return n
+    end)
+    return okC and tonumber(have) or 0
+end
+
+local onRecipes = function() end
+local function readRecipes(dir)
+    local out = {}
+    if not dir or type(dir.Recipes) ~= "table" then return out end
+    for i, r in ipairs(dir.Recipes) do
+        if type(r) == "table" and r.Result and type(r.Ingredients) == "table" and r.Hidden ~= true then
+            local name = tostring(gval(function() return r.Result:GetId() end) or ("Recipe " .. i))
+            local open = r.EnabledFFlag == nil or flagValue(r.EnabledFFlag) ~= false
+            local ready, missing = true, {}
+            for _, ing in ipairs(r.Ingredients) do
+                local need, have = ingredientNeed(dir, ing), ingredientHave(dir, ing)
+                if have < need then
+                    ready = false
+                    missing[#missing + 1] = string.format("%s %d/%d", tostring(gval(function() return ing.Item:GetId() end) or "?"), have, need)
+                end
+            end
+            out[#out + 1] = { index = i, name = name, open = open, ready = ready, missing = table.concat(missing, ", ") }
+        end
+    end
+    lastRecipes = out
+    pcall(onRecipes, out)
+    return out
+end
+
+local function root()
+    local c = LP.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+local function humanoid()
+    local c = LP.Character
+    return c and c:FindFirstChildOfClass("Humanoid")
+end
+local function flatDist(a, b)
+    return Vector3.new(a.X - b.X, 0, a.Z - b.Z).Magnitude
+end
+
+-- walk straight toward a point (jumps if stuck). Returns true when close enough.
+local function moveDirect(hum, target, timeout, reach)
+    local r = root()
+    if not r then return false end
+    local t0 = os.clock()
+    local lastPos, lastT = r.Position, os.clock()
+    hum:MoveTo(target)
+    while alive and os.clock() - t0 < timeout do
+        r = root()
+        if not r or hum.Health <= 0 then return false end
+        if flatDist(r.Position, target) < reach then return true end
+        if os.clock() - lastT > 1 then
+            if (r.Position - lastPos).Magnitude < 1 then hum.Jump = true end
+            lastPos, lastT = r.Position, os.clock()
+            hum:MoveTo(target)
+        end
+        task.wait(0.1)
+    end
+    return false
+end
+
+-- walk to a point using pathfinding, falling back to a straight walk
+local function walkTo(target, within)
+    local hum, r = humanoid(), root()
+    if not (hum and r) then return false end
+    if flatDist(r.Position, target) < within then return true end
+    local deadline = os.clock() + 45
+    local path = PathfindingService:CreatePath({ AgentRadius = 2, AgentHeight = 5, AgentCanJump = true })
+    local okP = pcall(function() path:ComputeAsync(r.Position, target) end)
+    if okP and path.Status == Enum.PathStatus.Success then
+        for _, wp in ipairs(path:GetWaypoints()) do
+            if not alive or os.clock() > deadline then break end
+            if wp.Action == Enum.PathWaypointAction.Jump then hum.Jump = true end
+            if not moveDirect(hum, wp.Position, 4, 3) then break end
+        end
+    end
+    if alive and os.clock() < deadline then
+        moveDirect(hum, target, math.max(3, deadline - os.clock()), within)
+    end
+    r = root()
+    return r ~= nil and flatDist(r.Position, target) < within + 1.5
+end
+
+local function standPos()
+    local ok, m = gcall(function() return Instancing.GetModel() end)
+    if not (ok and typeof(m) == "Instance") then return nil end
+    local inter = m:FindFirstChild("INTERACT")
+    local machines = inter and inter:FindFirstChild("Machines")
+    local mach = machines and machines:FindFirstChild(MACHINE_MODEL)
+    if not mach then return nil end
+    local pad = mach:FindFirstChild("Pad", true)
+    if pad and pad:IsA("BasePart") then return pad.Position end
+    return mach:GetPivot().Position
+end
+
+local function fmt(s)
+    s = math.max(0, math.floor(s))
+    if s >= 3600 then return string.format("%dh %dm", s // 3600, (s % 3600) // 60) end
+    if s >= 60 then return string.format("%dm %ds", s // 60, s % 60) end
+    return s .. "s"
+end
+
+local function pickedCount()
+    local n = 0
+    for _, v in pairs(picks) do if v then n += 1 end end
+    return n
+end
+
+---------------------------------------------------------------- main logic
+local busy = false
+local REACH = 5 -- studs from the machine pad
+
+local function retry(fn, tries, delay)
+    for i = 1, tries do
+        if not alive then return false end
+        if fn() then return true end
+        task.wait(delay)
+    end
+    return false
+end
+
+local function sweep(forceClaim, forceCraft)
+    if busy then return end
+    busy = true
+    local origin -- where you were standing before walking to the machine
+    local ok, err = pcall(function()
+        if not ensureModules() then claimNote = "Waiting for game..." return end
+        local dir = machineDir()
+        if not dir then claimNote = "Machine not found" return end
+        if isfn(Forge, "CombineMode") and gval(Forge.CombineMode) == false then
+            claimNote = "Combine-o-Matic is closed"
+            return
+        end
+
+        local okQ, queue = gcall(Network.Invoke, "HalloweenCraftingMachine_GetQueue")
+        if not okQ or type(queue) ~= "table" then claimNote = "Can't read queue" return end
+
+        local queued, claims, nextIn = {}, {}, nil
+        for _, e in ipairs(queue) do
+            if type(e) == "table" and (e.MachineId == nil or e.MachineId == dir._id) and e.RecipeIndex then
+                queued[e.RecipeIndex] = e
+                local rem = tonumber(e.Remaining) or 0
+                if rem <= 0 and e.UID then
+                    claims[#claims + 1] = e
+                elseif not nextIn or rem < nextIn then
+                    nextIn = rem
+                end
+            end
+        end
+
+        local doClaim = autoClaim or forceClaim
+        local doCraft = autoCraft or forceCraft
+        if not doClaim then claims = {} end
+
+        -- work out what needs doing BEFORE walking anywhere
+        local claimingIdx = {}
+        for _, e in ipairs(claims) do claimingIdx[e.RecipeIndex] = true end
+        local function startable(recipes)
+            local list = {}
+            for i = #recipes, 1, -1 do
+                local r = recipes[i]
+                if picks[r.name] and r.open and r.ready and (not queued[r.index] or claimingIdx[r.index]) then
+                    list[#list + 1] = r
+                end
+            end
+            return list
+        end
+
+        local recipes, starts = {}, {}
+        if doCraft then
+            if pickedCount() == 0 then
+                craftNote = "Pick crafts below"
+            else
+                recipes = readRecipes(dir)
+                starts = startable(recipes)
+                if #starts == 0 then
+                    local why
+                    for _, r in ipairs(recipes) do
+                        if picks[r.name] and not why then
+                            if queued[r.index] and not claimingIdx[r.index] then why = r.name .. " is crafting"
+                            elseif not r.ready then why = r.name .. " needs " .. r.missing end
+                        end
+                    end
+                    craftNote = why or "Nothing to craft"
+                end
+            end
+        end
+
+        claimNote = nextIn and ("Next in " .. fmt(nextIn)) or ((#queue == 0) and "Nothing crafting" or "All claimed")
+        if #claims == 0 and #starts == 0 then return end
+
+        -- walk to the machine (remember where we came from)
+        if gotoMachine then
+            local stand = standPos()
+            local r = root()
+            if stand and r then
+                origin = r.Position
+                claimNote = "Walking to machine..."
+                if not walkTo(stand, REACH) then
+                    claimNote = "Couldn't reach machine"
+                    return
+                end
+                task.wait(0.3)
+            end
+        end
+
+        -- claim finished crafts (retry until the game accepts it)
+        for _, e in ipairs(claims) do
+            claimNote = "Claiming..."
+            local done = retry(function()
+                local ok2, res = gcall(Network.Invoke, "HalloweenCraftingMachine_Claim", e.UID)
+                return ok2 and res and true or false
+            end, 8, 1)
+            if done then
+                claimed += 1
+                queued[e.RecipeIndex] = nil
+            end
+            task.wait(0.5)
+        end
+
+        -- start picked crafts; keep trying until each one actually starts
+        if doCraft and #starts > 0 then
+            if #claims > 0 then
+                recipes = readRecipes(dir)
+                starts = startable(recipes)
+            end
+            local startedNow, problem
+            for _, r in ipairs(starts) do
+                craftNote = "Crafting " .. r.name .. "..."
+                local msgOut
+                local done = retry(function()
+                    -- make sure we still have the pets (earlier crafts may have used them)
+                    local fresh
+                    for _, x in ipairs(readRecipes(dir)) do if x.index == r.index then fresh = x end end
+                    if not (fresh and fresh.ready) then msgOut = "not enough pets" return true end
+                    local ok2, res, msg = gcall(Network.Invoke, "HalloweenCraftingMachine_StartCraft", dir._id, r.index)
+                    msgOut = msg or res
+                    return ok2 and res and true or false
+                end, 10, 1)
+                if done and msgOut ~= "not enough pets" then
+                    started += 1
+                    startedNow = r.name
+                    queued[r.index] = true
+                    task.wait(math.max(1, tonumber(dir.Cooldowns and dir.Cooldowns[1]) or 1) + 0.2)
+                else
+                    problem = problem or (r.name .. " not started: " .. tostring(msgOut))
+                end
+            end
+            craftNote = startedNow and ("Started " .. startedNow) or (problem or "Nothing to craft")
+            readRecipes(dir)
+        end
+    end)
+
+    -- walk back to where we were standing
+    if origin and alive then
+        local r = root()
+        if r and flatDist(r.Position, origin) > 3 then
+            local prev = claimNote
+            claimNote = "Walking back..."
+            walkTo(origin, 3)
+            claimNote = prev
+        end
+    end
+    if not ok then claimNote = "Error (see F9)" warn("[AutoClaimCrafts] " .. tostring(err)) end
+    busy = false
+end
+
+---------------------------------------------------------------- GUI
+local BG, PANEL, PANEL2, ACCENT, TEXT, DIM, OFF, GOOD, BAD =
+    Color3.fromRGB(20, 20, 27), Color3.fromRGB(32, 32, 42), Color3.fromRGB(42, 42, 54),
+    Color3.fromRGB(120, 90, 255), Color3.fromRGB(235, 235, 245), Color3.fromRGB(150, 150, 172),
+    Color3.fromRGB(70, 70, 88), Color3.fromRGB(80, 210, 120), Color3.fromRGB(200, 90, 90)
+
+local function mk(class, props, parent)
+    local o = Instance.new(class)
+    for k, v in pairs(props) do o[k] = v end
+    o.Parent = parent
+    return o
+end
+
+local guiParent = (type(gethui) == "function" and gethui())
+    or (pcall(function() return game:GetService("CoreGui").Name end) and game:GetService("CoreGui"))
+    or LP:WaitForChild("PlayerGui")
+
+local gui = mk("ScreenGui", { Name = "AutoClaimCrafts", ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling }, guiParent)
+
+local W, H = 270, 232
+local main = mk("Frame", {
+    Size = UDim2.fromOffset(W, H), Position = UDim2.new(0, 20, 0.3, 0),
+    BackgroundColor3 = BG, BorderSizePixel = 0,
+}, gui)
+mk("UICorner", { CornerRadius = UDim.new(0, 12) }, main)
+mk("UIStroke", { Color = ACCENT, Thickness = 1.2, Transparency = 0.35 }, main)
+
+local bar = mk("Frame", { Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = PANEL, BorderSizePixel = 0 }, main)
+mk("UICorner", { CornerRadius = UDim.new(0, 12) }, bar)
+mk("Frame", { Size = UDim2.new(1, 0, 0, 10), Position = UDim2.new(0, 0, 1, -10), BackgroundColor3 = PANEL, BorderSizePixel = 0 }, bar)
+mk("TextLabel", {
+    BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, -70, 1, 0),
+    Text = "Auto Craft + Claim", TextXAlignment = Enum.TextXAlignment.Left,
+    Font = Enum.Font.GothamBold, TextSize = 14, TextColor3 = TEXT,
+}, bar)
+
+local body = mk("Frame", { BackgroundTransparency = 1, Position = UDim2.fromOffset(0, 32), Size = UDim2.new(1, 0, 1, -32) }, main)
+
+local minBtn = mk("TextButton", {
+    Text = "-", Font = Enum.Font.GothamBold, TextSize = 18, TextColor3 = DIM, BackgroundTransparency = 1,
+    Size = UDim2.fromOffset(30, 32), Position = UDim2.new(1, -60, 0, 0),
+}, bar)
+local closeBtn = mk("TextButton", {
+    Text = "x", Font = Enum.Font.GothamBold, TextSize = 14, TextColor3 = DIM, BackgroundTransparency = 1,
+    Size = UDim2.fromOffset(30, 32), Position = UDim2.new(1, -30, 0, 0),
+}, bar)
+
+local function toggle(y, text, default, cb)
+    local row = mk("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, -24, 0, 26), Position = UDim2.fromOffset(12, y) }, body)
+    mk("TextLabel", {
+        BackgroundTransparency = 1, Size = UDim2.new(1, -50, 1, 0), Text = text,
+        TextXAlignment = Enum.TextXAlignment.Left, Font = Enum.Font.Gotham, TextSize = 13, TextColor3 = TEXT,
+    }, row)
+    local pill = mk("TextButton", {
+        AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, 0, 0.5, 0), Size = UDim2.fromOffset(40, 20),
+        Text = "", AutoButtonColor = false, BackgroundColor3 = default and ACCENT or OFF,
+    }, row)
+    mk("UICorner", { CornerRadius = UDim.new(1, 0) }, pill)
+    local knob = mk("Frame", {
+        Size = UDim2.fromOffset(14, 14), AnchorPoint = Vector2.new(0, 0.5),
+        Position = default and UDim2.new(1, -17, 0.5, 0) or UDim2.new(0, 3, 0.5, 0),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+    }, pill)
+    mk("UICorner", { CornerRadius = UDim.new(1, 0) }, knob)
+    local on = default
+    pill.MouseButton1Click:Connect(function()
+        on = not on
+        local info = TweenInfo.new(0.15, Enum.EasingStyle.Quad)
+        TweenService:Create(pill, info, { BackgroundColor3 = on and ACCENT or OFF }):Play()
+        TweenService:Create(knob, info, { Position = on and UDim2.new(1, -17, 0.5, 0) or UDim2.new(0, 3, 0.5, 0) }):Play()
+        cb(on)
+    end)
+end
+
+toggle(6, "Auto claim", autoClaim, function(v) autoClaim = v end)
+toggle(34, "Auto craft", autoCraft, function(v) autoCraft = v end)
+toggle(62, "Walk to machine", gotoMachine, function(v) gotoMachine = v end)
+
+-- dropdown button
+local ddBtn = mk("TextButton", {
+    Position = UDim2.fromOffset(12, 94), Size = UDim2.new(1, -24, 0, 28), Text = "",
+    BackgroundColor3 = PANEL, AutoButtonColor = false,
+}, body)
+mk("UICorner", { CornerRadius = UDim.new(0, 8) }, ddBtn)
+local ddStroke = mk("UIStroke", { Color = OFF, Thickness = 1 }, ddBtn)
+local ddText = mk("TextLabel", {
+    BackgroundTransparency = 1, Position = UDim2.fromOffset(10, 0), Size = UDim2.new(1, -34, 1, 0),
+    Text = "Crafts: none selected", TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+    Font = Enum.Font.Gotham, TextSize = 13, TextColor3 = TEXT,
+}, ddBtn)
+local arrow = mk("TextLabel", {
+    BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -8, 0.5, 0),
+    Size = UDim2.fromOffset(18, 18), Text = "v", Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = DIM,
+}, ddBtn)
+
+local s1 = mk("TextLabel", {
+    BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 128), Size = UDim2.new(1, -24, 0, 15),
+    Text = "", TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+    Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = DIM,
+}, body)
+local s2 = mk("TextLabel", {
+    BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 145), Size = UDim2.new(1, -24, 0, 15),
+    Text = "", TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+    Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = DIM,
+}, body)
+
+local function smallBtn(x, w, text, cb)
+    local b = mk("TextButton", {
+        Position = UDim2.new(x, x == 0 and 12 or 3, 0, 166), Size = UDim2.new(w, -15, 0, 26), Text = text,
+        Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = TEXT, BackgroundColor3 = PANEL2, AutoButtonColor = true,
+    }, body)
+    mk("UICorner", { CornerRadius = UDim.new(0, 8) }, b)
+    b.MouseButton1Click:Connect(cb)
+    return b
+end
+smallBtn(0, 0.5, "Claim now", function() task.spawn(sweep, true, false) end)
+smallBtn(0.5, 0.5, "Craft now", function() task.spawn(sweep, false, true) end)
+
+-- dropdown list (overlay, animated)
+local LIST_Y = 32 + 94 + 32
+local list = mk("ScrollingFrame", {
+    Position = UDim2.fromOffset(12, LIST_Y), Size = UDim2.new(1, -24, 0, 0), Visible = false,
+    BackgroundColor3 = PANEL, BorderSizePixel = 0, ScrollBarThickness = 3, ScrollBarImageColor3 = ACCENT,
+    CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    ClipsDescendants = true, ZIndex = 10,
+}, main)
+mk("UICorner", { CornerRadius = UDim.new(0, 8) }, list)
+mk("UIStroke", { Color = ACCENT, Thickness = 1, Transparency = 0.5 }, list)
+mk("UIListLayout", { Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder }, list)
+mk("UIPadding", { PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 4), PaddingLeft = UDim.new(0, 4), PaddingRight = UDim.new(0, 6) }, list)
+
+local rows, rowKey = {}, ""
+local open = false
+local MAXH = 118
+
+local function listHeight()
+    local n = math.max(1, #lastRecipes)
+    return math.min(MAXH, n * 28 + 10)
+end
+
+local function setOpen(v)
+    open = v
+    local info = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+    TweenService:Create(arrow, info, { Rotation = open and 180 or 0 }):Play()
+    TweenService:Create(ddStroke, info, { Color = open and ACCENT or OFF }):Play()
+    if open then
+        list.Visible = true
+        TweenService:Create(list, info, { Size = UDim2.new(1, -24, 0, listHeight()) }):Play()
+    else
+        local t = TweenService:Create(list, info, { Size = UDim2.new(1, -24, 0, 0) })
+        t.Completed:Connect(function() if not open then list.Visible = false end end)
+        t:Play()
+    end
+end
+ddBtn.MouseButton1Click:Connect(function() setOpen(not open) end)
+
+local function updateDdText()
+    local names = {}
+    for _, r in ipairs(lastRecipes) do if picks[r.name] then names[#names + 1] = r.name end end
+    if #names == 0 then ddText.Text = "Crafts: none selected"
+    elseif #names == 1 then ddText.Text = names[1]
+    else ddText.Text = string.format("Crafts: %d selected", #names) end
+end
+
+onRecipes = function(recipes)
+    local key = ""
+    for _, r in ipairs(recipes) do key ..= r.name .. "|" end
+    if key ~= rowKey then
+        rowKey = key
+        for _, row in pairs(rows) do row.frame:Destroy() end
+        rows = {}
+        for i, r in ipairs(recipes) do
+            local frame = mk("TextButton", {
+                Size = UDim2.new(1, 0, 0, 26), BackgroundColor3 = PANEL2, BackgroundTransparency = 1,
+                Text = "", AutoButtonColor = false, LayoutOrder = -i, ZIndex = 11,
+            }, list)
+            mk("UICorner", { CornerRadius = UDim.new(0, 6) }, frame)
+            local box = mk("Frame", {
+                Size = UDim2.fromOffset(14, 14), Position = UDim2.new(0, 6, 0.5, -7),
+                BackgroundColor3 = picks[r.name] and ACCENT or OFF, ZIndex = 12,
+            }, frame)
+            mk("UICorner", { CornerRadius = UDim.new(0, 4) }, box)
+            mk("TextLabel", {
+                BackgroundTransparency = 1, Position = UDim2.fromOffset(28, 0), Size = UDim2.new(1, -46, 1, 0),
+                Text = r.name, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+                Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = TEXT, ZIndex = 12,
+            }, frame)
+            local dot = mk("Frame", {
+                AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -6, 0.5, 0), Size = UDim2.fromOffset(8, 8),
+                BackgroundColor3 = r.ready and GOOD or BAD, ZIndex = 12,
+            }, frame)
+            mk("UICorner", { CornerRadius = UDim.new(1, 0) }, dot)
+            frame.MouseEnter:Connect(function() TweenService:Create(frame, TweenInfo.new(0.1), { BackgroundTransparency = 0.4 }):Play() end)
+            frame.MouseLeave:Connect(function() TweenService:Create(frame, TweenInfo.new(0.1), { BackgroundTransparency = 1 }):Play() end)
+            frame.MouseButton1Click:Connect(function()
+                picks[r.name] = not picks[r.name] or nil
+                TweenService:Create(box, TweenInfo.new(0.15), { BackgroundColor3 = picks[r.name] and ACCENT or OFF }):Play()
+                updateDdText()
+            end)
+            rows[r.name] = { frame = frame, box = box, dot = dot }
+        end
+        if open then TweenService:Create(list, TweenInfo.new(0.2), { Size = UDim2.new(1, -24, 0, listHeight()) }):Play() end
+    else
+        for _, r in ipairs(recipes) do
+            local row = rows[r.name]
+            if row then row.dot.BackgroundColor3 = r.ready and GOOD or BAD end
+        end
+    end
+    updateDdText()
+end
+
+-- minimize
+local minimized = false
+minBtn.MouseButton1Click:Connect(function()
+    minimized = not minimized
+    if minimized and open then setOpen(false) end
+    body.Visible = not minimized
+    TweenService:Create(main, TweenInfo.new(0.2, Enum.EasingStyle.Quad), { Size = UDim2.fromOffset(W, minimized and 32 or H) }):Play()
+end)
+
+-- dragging (mouse + touch)
+do
+    local dragging, dragStart, startPos
+    bar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging, dragStart, startPos = true, input.Position, main.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+    UIS.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local d = input.Position - dragStart
+            main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end)
+end
+
+---------------------------------------------------------------- loops
+local function stop()
+    alive = false
+    pcall(function() gui:Destroy() end)
+end
+closeBtn.MouseButton1Click:Connect(stop)
+genv.AutoClaimCrafts = { Stop = stop }
+
+task.spawn(function()
+    while alive do
+        s1.Text = string.format("Claim: %s  (%d claimed)", claimNote, claimed)
+        s2.Text = string.format("Craft: %s  (%d started)", craftNote, started)
+        task.wait(0.5)
+    end
+end)
+
+-- load recipe list for the dropdown as soon as the game data is ready
+task.spawn(function()
+    while alive and #lastRecipes == 0 do
+        if ensureModules() then
+            local dir = machineDir()
+            if dir then pcall(readRecipes, dir) end
+        end
+        task.wait(2)
+    end
+end)
+
+task.spawn(function()
+    while alive do
+        if autoClaim or autoCraft then sweep(false, false) end
+        local t = 0
+        while alive and t < POLL do task.wait(0.25) t += 0.25 end
+    end
+end)
