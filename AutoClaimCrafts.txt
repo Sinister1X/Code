@@ -1,0 +1,297 @@
+-- Auto Claim Crafts | small draggable toggle GUI
+-- Claims finished Combine-o-Matic crafts automatically. Does not start crafts.
+-- Uses the same calls as the VY hub's claim logic.
+
+local genv = (type(getgenv) == "function" and getgenv()) or _G
+if type(genv.AutoClaimCrafts) == "table" and type(genv.AutoClaimCrafts.Stop) == "function" then
+    pcall(genv.AutoClaimCrafts.Stop)
+end
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local UIS = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local LP = Players.LocalPlayer
+
+local MACHINE_ID = "HalloweenGamesCombine"
+local MACHINE_MODEL = "HalloweenPetCraftingMachine"
+local POLL = 3 -- seconds between checks
+
+local alive = true
+local autoOn = true
+local gotoMachine = true -- fall back to walking to the machine if claim is refused
+local claimed = 0
+local statusText = "Starting..."
+
+---------------------------------------------------------------- game access
+local canId = type(setthreadidentity) == "function"
+local idGame, idExec = 2, 7
+if type(getthreadidentity) == "function" then
+    local ok, id = pcall(getthreadidentity)
+    if ok and type(id) == "number" then idExec = id end
+end
+
+local function gcall(fn, ...)
+    if type(fn) ~= "function" then return false, "not a function" end
+    if canId then pcall(setthreadidentity, idGame) end
+    local r = table.pack(pcall(fn, ...))
+    if canId then pcall(setthreadidentity, idExec) end
+    return table.unpack(r, 1, r.n)
+end
+
+local function req(path)
+    local ok, mod = gcall(function()
+        local node = RS
+        for seg in string.gmatch(path, "[^%.]+") do
+            node = node:WaitForChild(seg, 10) or error("missing " .. path)
+        end
+        return require(node)
+    end)
+    return ok and mod or nil
+end
+
+local Network, Directory, Instancing
+
+local function ensureModules()
+    if Network and Directory then return true end
+    Network = Network or req("Library.Client.Network")
+    Directory = Directory or req("Library.Directory")
+    Instancing = Instancing or req("Library.Client.InstancingCmds")
+    return Network ~= nil and Directory ~= nil
+end
+
+local function machineId()
+    local ok, id = gcall(function()
+        return Directory.HalloweenCraftingMachines[MACHINE_ID]._id
+    end)
+    return ok and id or nil
+end
+
+local function standPos()
+    local ok, m = gcall(function() return Instancing.GetModel() end)
+    if not (ok and typeof(m) == "Instance") then return nil end
+    local inter = m:FindFirstChild("INTERACT")
+    local machines = inter and inter:FindFirstChild("Machines")
+    local mach = machines and machines:FindFirstChild(MACHINE_MODEL)
+    if not mach then return nil end
+    local pad = mach:FindFirstChild("Pad", true)
+    if pad and pad:IsA("BasePart") then return pad.Position + Vector3.new(0, 3, 0) end
+    return mach:GetPivot().Position + Vector3.new(0, 3, 6)
+end
+
+local function root()
+    local c = LP.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function tp(pos)
+    local c, r = LP.Character, root()
+    if not (c and r) then return end
+    pcall(function()
+        r.AssemblyLinearVelocity = Vector3.zero
+        c:PivotTo(CFrame.new(pos) * (r.CFrame - r.CFrame.Position))
+    end)
+end
+
+local function claim(uid)
+    local ok, res = gcall(Network.Invoke, "HalloweenCraftingMachine_Claim", uid)
+    return ok and res and true or false
+end
+
+local function fmt(s)
+    s = math.max(0, math.floor(s))
+    if s >= 3600 then return string.format("%dh %dm", s // 3600, (s % 3600) // 60) end
+    if s >= 60 then return string.format("%dm %ds", s // 60, s % 60) end
+    return s .. "s"
+end
+
+local busy = false
+local function sweep()
+    if busy then return end
+    busy = true
+    pcall(function()
+        if not ensureModules() then statusText = "Waiting for game..." return end
+        local id = machineId()
+        if not id then statusText = "Machine not found" return end
+
+        local ok, queue = gcall(Network.Invoke, "HalloweenCraftingMachine_GetQueue")
+        if not ok or type(queue) ~= "table" then statusText = "Can't read queue" return end
+
+        local ready, nextIn = {}, nil
+        for _, e in ipairs(queue) do
+            if type(e) == "table" and (e.MachineId == nil or e.MachineId == id) and e.UID then
+                local rem = tonumber(e.Remaining) or 0
+                if rem <= 0 then
+                    ready[#ready + 1] = e
+                elseif not nextIn or rem < nextIn then
+                    nextIn = rem
+                end
+            end
+        end
+
+        local failed = {}
+        for _, e in ipairs(ready) do
+            if claim(e.UID) then claimed += 1 else failed[#failed + 1] = e end
+            task.wait(0.4)
+        end
+
+        if #failed > 0 and gotoMachine then
+            local stand = standPos()
+            local r = root()
+            local back = r and r.Position
+            if stand then
+                tp(stand)
+                task.wait(0.8)
+                for _, e in ipairs(failed) do
+                    if claim(e.UID) then claimed += 1 end
+                    task.wait(0.5)
+                end
+                if back then tp(back) end
+            end
+        end
+
+        if nextIn then
+            statusText = "Next in " .. fmt(nextIn)
+        else
+            statusText = (#queue == 0) and "Nothing crafting" or "All claimed"
+        end
+    end)
+    busy = false
+end
+
+---------------------------------------------------------------- GUI
+local BG, PANEL, ACCENT, TEXT, DIM, OFF =
+    Color3.fromRGB(22, 22, 28), Color3.fromRGB(32, 32, 40), Color3.fromRGB(120, 90, 255),
+    Color3.fromRGB(235, 235, 245), Color3.fromRGB(150, 150, 170), Color3.fromRGB(70, 70, 85)
+
+local function mk(class, props, parent)
+    local o = Instance.new(class)
+    for k, v in pairs(props) do o[k] = v end
+    o.Parent = parent
+    return o
+end
+
+local guiParent = (type(gethui) == "function" and gethui())
+    or (pcall(function() return game:GetService("CoreGui").Name end) and game:GetService("CoreGui"))
+    or LP:WaitForChild("PlayerGui")
+
+local gui = mk("ScreenGui", { Name = "AutoClaimCrafts", ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling }, guiParent)
+
+local main = mk("Frame", {
+    Size = UDim2.fromOffset(200, 128), Position = UDim2.new(0, 20, 0.35, 0),
+    BackgroundColor3 = BG, BorderSizePixel = 0,
+}, gui)
+mk("UICorner", { CornerRadius = UDim.new(0, 10) }, main)
+mk("UIStroke", { Color = ACCENT, Thickness = 1.2, Transparency = 0.35 }, main)
+
+local bar = mk("Frame", { Size = UDim2.new(1, 0, 0, 28), BackgroundColor3 = PANEL, BorderSizePixel = 0 }, main)
+mk("UICorner", { CornerRadius = UDim.new(0, 10) }, bar)
+mk("Frame", { Size = UDim2.new(1, 0, 0, 8), Position = UDim2.new(0, 0, 1, -8), BackgroundColor3 = PANEL, BorderSizePixel = 0 }, bar)
+mk("TextLabel", {
+    BackgroundTransparency = 1, Position = UDim2.fromOffset(10, 0), Size = UDim2.new(1, -60, 1, 0),
+    Text = "Auto Claim Crafts", TextXAlignment = Enum.TextXAlignment.Left,
+    Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = TEXT,
+}, bar)
+
+local body = mk("Frame", { BackgroundTransparency = 1, Position = UDim2.fromOffset(0, 28), Size = UDim2.new(1, 0, 1, -28) }, main)
+
+local minBtn = mk("TextButton", {
+    Text = "-", Font = Enum.Font.GothamBold, TextSize = 16, TextColor3 = DIM, BackgroundTransparency = 1,
+    Size = UDim2.fromOffset(26, 28), Position = UDim2.new(1, -52, 0, 0),
+}, bar)
+local closeBtn = mk("TextButton", {
+    Text = "x", Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = DIM, BackgroundTransparency = 1,
+    Size = UDim2.fromOffset(26, 28), Position = UDim2.new(1, -26, 0, 0),
+}, bar)
+
+local minimized = false
+minBtn.MouseButton1Click:Connect(function()
+    minimized = not minimized
+    body.Visible = not minimized
+    main.Size = minimized and UDim2.fromOffset(200, 28) or UDim2.fromOffset(200, 128)
+end)
+
+local function toggle(y, text, default, cb)
+    local row = mk("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, -20, 0, 24), Position = UDim2.fromOffset(10, y) }, body)
+    mk("TextLabel", {
+        BackgroundTransparency = 1, Size = UDim2.new(1, -46, 1, 0), Text = text,
+        TextXAlignment = Enum.TextXAlignment.Left, Font = Enum.Font.Gotham, TextSize = 13, TextColor3 = TEXT,
+    }, row)
+    local pill = mk("TextButton", {
+        AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, 0, 0.5, 0), Size = UDim2.fromOffset(38, 20),
+        Text = "", AutoButtonColor = false, BackgroundColor3 = default and ACCENT or OFF,
+    }, row)
+    mk("UICorner", { CornerRadius = UDim.new(1, 0) }, pill)
+    local knob = mk("Frame", {
+        Size = UDim2.fromOffset(14, 14), AnchorPoint = Vector2.new(0, 0.5),
+        Position = default and UDim2.new(1, -17, 0.5, 0) or UDim2.new(0, 3, 0.5, 0),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+    }, pill)
+    mk("UICorner", { CornerRadius = UDim.new(1, 0) }, knob)
+    local on = default
+    pill.MouseButton1Click:Connect(function()
+        on = not on
+        local info = TweenInfo.new(0.15)
+        TweenService:Create(pill, info, { BackgroundColor3 = on and ACCENT or OFF }):Play()
+        TweenService:Create(knob, info, { Position = on and UDim2.new(1, -17, 0.5, 0) or UDim2.new(0, 3, 0.5, 0) }):Play()
+        cb(on)
+    end)
+end
+
+toggle(6, "Auto claim", true, function(v) autoOn = v end)
+toggle(34, "Go to machine if needed", true, function(v) gotoMachine = v end)
+
+local status = mk("TextLabel", {
+    BackgroundTransparency = 1, Position = UDim2.fromOffset(10, 62), Size = UDim2.new(1, -20, 0, 16),
+    Text = statusText, TextXAlignment = Enum.TextXAlignment.Left,
+    Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = DIM,
+}, body)
+
+local claimBtn = mk("TextButton", {
+    Position = UDim2.fromOffset(10, 80), Size = UDim2.new(1, -20, 0, 20), Text = "Claim now",
+    Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = TEXT, BackgroundColor3 = PANEL, AutoButtonColor = true,
+}, body)
+mk("UICorner", { CornerRadius = UDim.new(0, 6) }, claimBtn)
+claimBtn.MouseButton1Click:Connect(function() task.spawn(sweep) end)
+
+-- dragging (mouse + touch)
+do
+    local dragging, dragStart, startPos
+    bar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging, dragStart, startPos = true, input.Position, main.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+    UIS.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local d = input.Position - dragStart
+            main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end)
+end
+
+---------------------------------------------------------------- loops
+local function stop()
+    alive = false
+    pcall(function() gui:Destroy() end)
+end
+closeBtn.MouseButton1Click:Connect(stop)
+genv.AutoClaimCrafts = { Stop = stop }
+
+task.spawn(function()
+    while alive do
+        status.Text = string.format("%s  |  claimed %d", statusText, claimed)
+        task.wait(0.5)
+    end
+end)
+
+task.spawn(function()
+    while alive do
+        if autoOn then sweep() end
+        local t = 0
+        while alive and t < POLL do task.wait(0.25) t += 0.25 end
+    end
+end)
