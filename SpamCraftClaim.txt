@@ -15,7 +15,7 @@ local LP = Players.LocalPlayer
 
 local MACHINE_ID = "HalloweenGamesCombine"
 local MACHINE_MODEL = "HalloweenPetCraftingMachine"
-local TICK = 0.1        -- seconds between attempts
+local TICK = 0.3        -- seconds between attempts
 local REFRESH = 0.004    -- seconds between queue / ingredient refreshes
 local REACH = 5          -- studs from the machine pad
 
