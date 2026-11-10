@@ -15,7 +15,7 @@ local LP = Players.LocalPlayer
 
 local MACHINE_ID = "HalloweenGamesCombine"
 local MACHINE_MODEL = "HalloweenPetCraftingMachine"
-local TICK = 1        -- seconds between attempts
+local TICK = 0.01        -- seconds between attempts
 local REFRESH = 0.004    -- seconds between queue / ingredient refreshes
 local REACH = 5          -- studs from the machine pad
 
@@ -314,7 +314,7 @@ local guiParent = (type(gethui) == "function" and gethui())
     or LP:WaitForChild("PlayerGui")
 local gui = mk("ScreenGui", { Name = "SpamCraftClaim", ResetOnSpawn = false }, guiParent)
 
-local W, H = 250, 262
+local W, H = 250, 308
 local main = mk("Frame", { Size = UDim2.fromOffset(W, H), Position = UDim2.new(0, 20, 0.3, 0), BackgroundColor3 = BG, BorderSizePixel = 0 }, gui)
 mk("UICorner", { CornerRadius = UDim.new(0, 12) }, main)
 mk("UIStroke", { Color = ACCENT, Thickness = 1.2, Transparency = 0.35 }, main)
@@ -332,7 +332,7 @@ local closeBtn = mk("TextButton", { Text = "x", Font = Enum.Font.GothamBold, Tex
 
 -- main toggle
 local tRow = mk("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, -24, 0, 28), Position = UDim2.fromOffset(12, 8) }, body)
-mk("TextLabel", { BackgroundTransparency = 1, Size = UDim2.new(1, -50, 1, 0), Text = "Spam claim/craft (0.01s)", TextXAlignment = Enum.TextXAlignment.Left, Font = Enum.Font.GothamMedium, TextSize = 13, TextColor3 = TEXT }, tRow)
+mk("TextLabel", { BackgroundTransparency = 1, Size = UDim2.new(1, -50, 1, 0), Text = "Spam claim/craft", TextXAlignment = Enum.TextXAlignment.Left, Font = Enum.Font.GothamMedium, TextSize = 13, TextColor3 = TEXT }, tRow)
 local pill = mk("TextButton", { AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, 0, 0.5, 0), Size = UDim2.fromOffset(40, 20), Text = "", AutoButtonColor = false, BackgroundColor3 = OFF }, tRow)
 mk("UICorner", { CornerRadius = UDim.new(1, 0) }, pill)
 local knob = mk("Frame", { Size = UDim2.fromOffset(14, 14), AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 3, 0.5, 0), BackgroundColor3 = Color3.new(1, 1, 1) }, pill)
@@ -357,6 +357,23 @@ mk("UIPadding", { PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 4), P
 
 local statusLbl = mk("TextLabel", { BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 188), Size = UDim2.new(1, -24, 0, 15), Text = "", TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = TEXT }, body)
 local countLbl = mk("TextLabel", { BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 206), Size = UDim2.new(1, -24, 0, 15), Text = "", TextXAlignment = Enum.TextXAlignment.Left, Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = DIM }, body)
+
+-- speed settings (type a number in seconds, 0 = as fast as possible)
+local function speedBox(x, w, labelText, getv, setv)
+    mk("TextLabel", { BackgroundTransparency = 1, Position = UDim2.fromOffset(x, 228), Size = UDim2.fromOffset(w, 14), Text = labelText, TextXAlignment = Enum.TextXAlignment.Left, Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = DIM }, body)
+    local box = mk("TextBox", {
+        Position = UDim2.fromOffset(x, 244), Size = UDim2.fromOffset(w, 24), Text = tostring(getv()), ClearTextOnFocus = false,
+        BackgroundColor3 = PANEL, BorderSizePixel = 0, Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = TEXT,
+    }, body)
+    mk("UICorner", { CornerRadius = UDim.new(0, 6) }, box)
+    box.FocusLost:Connect(function()
+        local n = tonumber(box.Text)
+        if n and n >= 0 then setv(n) end
+        box.Text = tostring(getv())
+    end)
+end
+speedBox(12, 100, "Spam delay (s)", function() return TICK end, function(v) TICK = v end)
+speedBox(126, 112, "Refresh delay (s)", function() return REFRESH end, function(v) REFRESH = v end)
 
 local rows, rowKey = {}, ""
 onRecipes = function(recipes)
